@@ -164,12 +164,13 @@ end
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 
-  -- intercept ELF files on BufReadCmd so nvim never tries to load binary
-  vim.api.nvim_create_autocmd("BufReadCmd", {
+  -- BufReadPost fires after normal loading, so non-ELF files are unaffected.
+  -- For ELF files we replace the buffer content with readelf output.
+  vim.api.nvim_create_autocmd("BufReadPost", {
     group = vim.api.nvim_create_augroup("bin_nvim", { clear = true }),
     callback = function(ev)
       local path = ev.match
-      if is_elf(path) then
+      if vim.fn.filereadable(path) == 1 and is_elf(path) then
         M.open(path)
       end
     end,
