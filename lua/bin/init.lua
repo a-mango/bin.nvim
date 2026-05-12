@@ -6,17 +6,25 @@ M.config = {
     "sections", "segments", "dynamic",
     "notes", "versions", "symbols", "strings",
   },
-  max_symbols = 200,
-  max_strings = 300,
+  max_symbols    = 200,
+  max_strings    = 300,
   min_string_len = 10,
 }
+
+-- ── helpers ───────────────────────────────────────────────────────────────────
 
 local function run(cmd)
   local result = vim.system(cmd, { text = true }):wait()
   if result.code ~= 0 then
-    return nil, result.stderr
+    return nil, (result.stderr or ""):gsub("\n$", "")
   end
   return result.stdout, nil
+end
+
+-- like run() but returns stdout even on non-zero exit
+local function run_lax(cmd)
+  local result = vim.system(cmd, { text = true }):wait()
+  return result.stdout or "", (result.stderr or ""):gsub("\n$", "")
 end
 
 local function is_elf(path)
@@ -40,67 +48,73 @@ local function section_header(title)
   return { "", "┌" .. bar, "│  " .. title, "└" .. bar, "" }
 end
 
-local function indent(out)
+local function indent(str)
   local result = {}
-  for _, line in ipairs(lines(out)) do
+  for _, line in ipairs(lines(str)) do
     result[#result + 1] = "  " .. line
   end
   return result
 end
 
+local function missing(tool)
+  return { "  (" .. tool .. " not installed — skipping)" }
+end
+
 -- ── collectors ────────────────────────────────────────────────────────────────
 
 local function collect_file(path)
+  if vim.fn.executable("file") == 0 then return missing("file") end
   local out, err = run({ "file", path })
-  if not out then return { "  [error] " .. (err or "file failed") } end
-  -- strip leading "path: "
+  if not out then return { "  [error] " .. err } end
   local info = out:gsub("^[^:]+:%s*", ""):gsub("\n$", "")
   return { "  " .. info }
 end
 
 local function collect_header(path)
   local out, err = run({ "readelf", "-h", path })
-  if not out then return { "  [error] " .. (err or "") } end
+  if not out then return { "  [error] " .. err } end
   return indent(out)
 end
 
 local function collect_checksec(path)
-  if vim.fn.executable("checksec") == 0 then
-    return { "  (checksec not found — install checksec)" }
-  end
+  if vim.fn.executable("checksec") == 0 then return missing("checksec") end
   local out, err = run({ "checksec", "--file=" .. path, "--output=csv" })
-  if not out then return { "  [error] " .. (err or "") } end
+  if not out then return { "  [error] " .. err } end
 
   local fields = {}
   for field in (out:gsub("\n$", "")):gmatch("[^,]+") do
     fields[#fields + 1] = field
   end
 
-  -- CSV: RELRO, STACK CANARY, NX, PIE, RPATH, RUNPATH, Symbols, FORTIFY, Fortified, Fortifiable, FILE
-  local labels = { "RELRO", "Stack Canary", "NX", "PIE", "RPATH", "RUNPATH", "Symbols", "FORTIFY", "Fortified", "Fortifiable" }
+  -- CSV order: RELRO, STACK CANARY, NX, PIE, RPATH, RUNPATH, Symbols, FORTIFY, Fortified, Fortifiable, FILE
+  local labels = {
+    "RELRO", "Stack Canary", "NX", "PIE",
+    "RPATH", "RUNPATH", "Symbols", "FORTIFY",
+    "Fortified", "Fortifiable",
+  }
   local result = {}
   for i, label in ipairs(labels) do
-    local val = fields[i] or "?"
-    result[#result + 1] = string.format("  %-16s %s", label .. ":", val)
+    result[#result + 1] = string.format("  %-16s %s", label .. ":", fields[i] or "?")
   end
   return result
 end
 
 local function collect_size(path)
+  if vim.fn.executable("size") == 0 then return missing("size") end
   local out, err = run({ "size", path })
-  if not out then return { "  [error] " .. (err or "") } end
+  if not out then return { "  [error] " .. err } end
   return indent(out)
 end
 
 local function collect_sections(path)
   local out, err = run({ "readelf", "-S", "--wide", path })
-  if not out then return { "  [error] " .. (err or "") } end
+  if not out then return { "  [error] " .. err } end
   return indent(out)
 end
 
 local function collect_segments(path)
   local out, err = run({ "readelf", "-l", "--wide", path })
-  if not out then return { "  [error] " .. (err or "") } end
+  if not out then return { "  [error] " .. err } end
   return indent(out)
 end
 
@@ -114,24 +128,27 @@ end
 
 local function collect_notes(path)
   local out, err = run({ "readelf", "-n", path })
-  if not out then return { "  [error] " .. (err or "") } end
+  if not out then return { "  [error] " .. err } end
   return indent(out)
 end
 
 local function collect_versions(path)
-  local out, err = run({ "readelf", "-V", path })
-  if not out then return { "  [error] " .. (err or "") } end
+  -- readelf -V exits non-zero on binaries with no version info
+  local out, _ = run_lax({ "readelf", "-V", path })
+  if out == "" or out:find("no symbol") or out:find("no version") then
+    return { "  (no version information)" }
+  end
   return indent(out)
 end
 
 local function collect_symbols(path, max)
   local out, err = run({ "readelf", "-s", "--wide", path })
-  if not out then return { "  [error] " .. (err or "") } end
+  if not out then return { "  [error] " .. err } end
   local result = {}
   local count = 0
   for _, line in ipairs(lines(out)) do
     if count >= max then
-      result[#result + 1] = string.format("  ... (truncated, showing %d/%d lines)", max, count)
+      result[#result + 1] = "  ... (first " .. max .. " lines shown — increase max_symbols to see more)"
       break
     end
     result[#result + 1] = "  " .. line
@@ -141,11 +158,11 @@ local function collect_symbols(path, max)
 end
 
 local function collect_strings(path, min_len, max)
+  if vim.fn.executable("strings") == 0 then return missing("strings") end
   local out, err = run({ "strings", "-n", tostring(min_len), path })
-  if not out then return { "  [error] " .. (err or "") } end
+  if not out then return { "  [error] " .. err } end
   local result = {}
-  local count = 0
-  local total = 0
+  local count, total = 0, 0
   for _, line in ipairs(lines(out)) do
     total = total + 1
     if count < max then
@@ -154,7 +171,7 @@ local function collect_strings(path, min_len, max)
     end
   end
   if total > max then
-    result[#result + 1] = string.format("  ... (truncated, showing %d/%d strings)", max, total)
+    result[#result + 1] = string.format("  ... (first %d/%d strings shown — increase max_strings to see more)", max, total)
   end
   return result
 end
@@ -162,17 +179,17 @@ end
 -- ── dispatch ──────────────────────────────────────────────────────────────────
 
 local dispatch = {
-  file     = function(path, _)   return collect_file(path) end,
-  header   = function(path, _)   return collect_header(path) end,
-  checksec = function(path, _)   return collect_checksec(path) end,
-  size     = function(path, _)   return collect_size(path) end,
-  sections = function(path, _)   return collect_sections(path) end,
-  segments = function(path, _)   return collect_segments(path) end,
-  dynamic  = function(path, _)   return collect_dynamic(path) end,
-  notes    = function(path, _)   return collect_notes(path) end,
-  versions = function(path, _)   return collect_versions(path) end,
-  symbols  = function(path, cfg) return collect_symbols(path, cfg.max_symbols) end,
-  strings  = function(path, cfg) return collect_strings(path, cfg.min_string_len, cfg.max_strings) end,
+  file     = function(p, _)   return collect_file(p) end,
+  header   = function(p, _)   return collect_header(p) end,
+  checksec = function(p, _)   return collect_checksec(p) end,
+  size     = function(p, _)   return collect_size(p) end,
+  sections = function(p, _)   return collect_sections(p) end,
+  segments = function(p, _)   return collect_segments(p) end,
+  dynamic  = function(p, _)   return collect_dynamic(p) end,
+  notes    = function(p, _)   return collect_notes(p) end,
+  versions = function(p, _)   return collect_versions(p) end,
+  symbols  = function(p, cfg) return collect_symbols(p, cfg.max_symbols) end,
+  strings  = function(p, cfg) return collect_strings(p, cfg.min_string_len, cfg.max_strings) end,
 }
 
 local titles = {
@@ -186,10 +203,20 @@ local titles = {
   notes    = "Notes",
   versions = "Version Information",
   symbols  = "Symbol Table",
-  strings  = "Strings (≥" .. M.config.min_string_len .. " chars)",
+  strings  = "Strings",
 }
 
 -- ── public API ────────────────────────────────────────────────────────────────
+
+local function set_keymaps(buf, path)
+  local opts = { noremap = true, silent = true }
+  pcall(vim.api.nvim_buf_del_keymap, buf, "n", "q")
+  pcall(vim.api.nvim_buf_del_keymap, buf, "n", "r")
+  vim.api.nvim_buf_set_keymap(buf, "n", "q", "<cmd>bd<cr>", opts)
+  vim.api.nvim_buf_set_keymap(buf, "n", "r", "", vim.tbl_extend("force", opts, {
+    callback = function() M.open(path) end,
+  }))
+end
 
 function M.open(path)
   path = path or vim.api.nvim_buf_get_name(0)
@@ -198,13 +225,12 @@ function M.open(path)
     return
   end
 
+  titles.strings = "Strings (≥" .. M.config.min_string_len .. " chars)"
+
   local content = {
     "  bin.nvim — " .. path,
     "  " .. string.rep("═", 58),
   }
-
-  -- update strings title in case min_string_len was customised
-  titles.strings = "Strings (≥" .. M.config.min_string_len .. " chars)"
 
   for _, sec in ipairs(M.config.sections) do
     local fn = dispatch[sec]
@@ -228,15 +254,7 @@ function M.open(path)
   vim.bo[buf].filetype   = "elf"
   vim.bo[buf].swapfile   = false
 
-  vim.api.nvim_buf_set_keymap(buf, "n", "q", "<cmd>bd<cr>", { noremap = true, silent = true })
-  vim.api.nvim_buf_set_keymap(buf, "n", "r", "", {
-    noremap = true, silent = true,
-    callback = function()
-      vim.bo[buf].modifiable = true
-      M.open(path)
-    end,
-  })
-
+  set_keymaps(buf, path)
   vim.api.nvim_set_current_buf(buf)
 end
 
