@@ -26,11 +26,17 @@ function M.check()
     vim.health.ok(name .. ": " .. path .. detail)
   end
 
+  -- required
   check("readelf",  "binutils", true)
+
+  -- optional tools (sections skipped gracefully when missing)
   check("file",     "file",     false)
   check("size",     "binutils", false)
   check("strings",  "binutils", false)
+  check("ldd",      "glibc",    false)
   check("checksec", "checksec", false)
+  check("c++filt",  "binutils", false)
+  check("rustfilt", "rustfilt", false)
 end
 
 return M

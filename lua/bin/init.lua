@@ -4,28 +4,21 @@ M.config = {
   sections = {
     "file", "header", "checksec", "size",
     "sections", "segments", "dynamic",
-    "notes", "versions", "symbols", "strings",
+    "notes", "versions", "relocations",
+    "symbols", "strings", "ldd", "dwarf",
   },
   max_symbols    = 200,
   max_strings    = 300,
   min_string_len = 10,
+  max_dwarf      = 300,
+  demangle       = true,
 }
 
+-- incremented on every M.open() call; async callbacks check against it to
+-- discard results from a superseded reload
+local current_gen = 0
+
 -- ── helpers ───────────────────────────────────────────────────────────────────
-
-local function run(cmd)
-  local result = vim.system(cmd, { text = true }):wait()
-  if result.code ~= 0 then
-    return nil, (result.stderr or ""):gsub("\n$", "")
-  end
-  return result.stdout, nil
-end
-
--- like run() but returns stdout even on non-zero exit
-local function run_lax(cmd)
-  local result = vim.system(cmd, { text = true }):wait()
-  return result.stdout or "", (result.stderr or ""):gsub("\n$", "")
-end
 
 local function is_elf(path)
   local f = io.open(path, "rb")
@@ -43,11 +36,6 @@ local function lines(str)
   return t
 end
 
-local function section_header(title)
-  local bar = string.rep("─", 60)
-  return { "", "┌" .. bar, "│  " .. title, "└" .. bar, "" }
-end
-
 local function indent(str)
   local result = {}
   for _, line in ipairs(lines(str)) do
@@ -60,163 +48,294 @@ local function missing(tool)
   return { "  (" .. tool .. " not installed — skipping)" }
 end
 
--- ── collectors ────────────────────────────────────────────────────────────────
-
-local function collect_file(path)
-  if vim.fn.executable("file") == 0 then return missing("file") end
-  local out, err = run({ "file", path })
-  if not out then return { "  [error] " .. err } end
-  local info = out:gsub("^[^:]+:%s*", ""):gsub("\n$", "")
-  return { "  " .. info }
+-- caps a list of plain strings; returns a new list with a trailing note when truncated
+local function cap(raw_lines, max, label)
+  if #raw_lines <= max then return raw_lines end
+  local t = {}
+  for i = 1, max do t[i] = raw_lines[i] end
+  t[#t + 1] = string.format("... (first %d/%d %s — adjust config to see more)", max, #raw_lines, label)
+  return t
 end
 
-local function collect_header(path)
-  local out, err = run({ "readelf", "-h", path })
-  if not out then return { "  [error] " .. err } end
-  return indent(out)
-end
+local section_titles = {
+  file        = "File",
+  header      = "ELF Header",
+  checksec    = "Security Properties",
+  size        = "Section Sizes",
+  sections    = "Section Headers",
+  segments    = "Program Headers / Segments",
+  dynamic     = "Dynamic Section",
+  notes       = "Notes",
+  versions    = "Version Information",
+  relocations = "Relocations",
+  symbols     = "Symbol Table",
+  strings     = "Strings",
+  ldd         = "Shared Library Dependencies",
+  dwarf       = "DWARF Debug Info",
+}
 
-local function collect_checksec(path)
-  if vim.fn.executable("checksec") == 0 then return missing("checksec") end
-  local out, err = run({ "checksec", "--file=" .. path, "--output=csv" })
-  if not out then return { "  [error] " .. err } end
-
-  local fields = {}
-  for field in (out:gsub("\n$", "")):gmatch("[^,]+") do
-    fields[#fields + 1] = field
+local function make_section_header(sec, cfg)
+  local title = section_titles[sec] or sec
+  if sec == "strings" then
+    title = string.format("Strings (≥%d chars)", cfg.min_string_len)
   end
+  local bar = string.rep("─", 60)
+  return { "", "┌" .. bar, "│  " .. title, "└" .. bar, "" }
+end
 
-  -- CSV order: RELRO, STACK CANARY, NX, PIE, RPATH, RUNPATH, Symbols, FORTIFY, Fortified, Fortifiable, FILE
-  local labels = {
-    "RELRO", "Stack Canary", "NX", "PIE",
-    "RPATH", "RUNPATH", "Symbols", "FORTIFY",
-    "Fortified", "Fortifiable",
-  }
-  local result = {}
-  for i, label in ipairs(labels) do
-    result[#result + 1] = string.format("  %-16s %s", label .. ":", fields[i] or "?")
+-- ── async utilities ───────────────────────────────────────────────────────────
+
+-- pipe `input` (string) through `cmd`; call cb(result_or_input_on_failure)
+local function pipe(cmd, input, cb)
+  vim.system(cmd, { text = true, stdin = input }, function(r)
+    cb((r.code == 0 and r.stdout) or input)
+  end)
+end
+
+-- run `out` through c++filt then rustfilt if available and cfg.demangle is set
+local function demangle(out, exe, cfg, cb)
+  if not cfg.demangle then cb(out); return end
+  if exe.cppfilt then
+    pipe({ "c++filt" }, out, function(d)
+      if exe.rustfilt then pipe({ "rustfilt" }, d, cb) else cb(d) end
+    end)
+  elseif exe.rustfilt then
+    pipe({ "rustfilt" }, out, cb)
+  else
+    cb(out)
   end
-  return result
 end
 
-local function collect_size(path)
-  if vim.fn.executable("size") == 0 then return missing("size") end
-  local out, err = run({ "size", path })
-  if not out then return { "  [error] " .. err } end
-  return indent(out)
+-- ── async section runners ─────────────────────────────────────────────────────
+-- signature: function(path, cfg, exe, cb)  where cb receives a lines table
+
+local runners = {}
+
+runners.file = function(path, _, exe, cb)
+  if not exe.file then cb(missing("file")); return end
+  vim.system({ "file", path }, { text = true }, function(r)
+    if r.code ~= 0 then cb({ "  [error] " .. r.stderr }); return end
+    local info = r.stdout:gsub("^[^:]+:%s*", ""):gsub("\n$", "")
+    cb({ "  " .. info })
+  end)
 end
 
-local function collect_sections(path)
-  local out, err = run({ "readelf", "-S", "--wide", path })
-  if not out then return { "  [error] " .. err } end
-  return indent(out)
+runners.header = function(path, _, _, cb)
+  vim.system({ "readelf", "-h", path }, { text = true }, function(r)
+    if r.code ~= 0 then cb({ "  [error] " .. r.stderr }); return end
+    cb(indent(r.stdout))
+  end)
 end
 
-local function collect_segments(path)
-  local out, err = run({ "readelf", "-l", "--wide", path })
-  if not out then return { "  [error] " .. err } end
-  return indent(out)
+runners.checksec = function(path, _, exe, cb)
+  if not exe.checksec then cb(missing("checksec")); return end
+  vim.system({ "checksec", "--file=" .. path, "--output=csv" }, { text = true }, function(r)
+    if r.code ~= 0 then cb({ "  [error] " .. r.stderr }); return end
+    local fields = {}
+    for f in (r.stdout:gsub("\n$", "")):gmatch("[^,]+") do
+      fields[#fields + 1] = f
+    end
+    local labels = {
+      "RELRO", "Stack Canary", "NX", "PIE",
+      "RPATH", "RUNPATH", "Symbols", "FORTIFY",
+      "Fortified", "Fortifiable",
+    }
+    local result = {}
+    for i, label in ipairs(labels) do
+      result[#result + 1] = string.format("  %-16s %s", label .. ":", fields[i] or "?")
+    end
+    cb(result)
+  end)
 end
 
-local function collect_dynamic(path)
-  local out, _ = run({ "readelf", "-d", path })
-  if not out or out:find("There is no dynamic section") then
-    return { "  (no dynamic section — static binary)" }
-  end
-  return indent(out)
+runners.size = function(path, _, exe, cb)
+  if not exe.size then cb(missing("size")); return end
+  vim.system({ "size", path }, { text = true }, function(r)
+    if r.code ~= 0 then cb({ "  [error] " .. r.stderr }); return end
+    cb(indent(r.stdout))
+  end)
 end
 
-local function collect_notes(path)
-  local out, err = run({ "readelf", "-n", path })
-  if not out then return { "  [error] " .. err } end
-  return indent(out)
+runners.sections = function(path, _, _, cb)
+  vim.system({ "readelf", "-S", "--wide", path }, { text = true }, function(r)
+    if r.code ~= 0 then cb({ "  [error] " .. r.stderr }); return end
+    cb(indent(r.stdout))
+  end)
 end
 
-local function collect_versions(path)
+runners.segments = function(path, _, _, cb)
+  vim.system({ "readelf", "-l", "--wide", path }, { text = true }, function(r)
+    if r.code ~= 0 then cb({ "  [error] " .. r.stderr }); return end
+    cb(indent(r.stdout))
+  end)
+end
+
+runners.dynamic = function(path, _, _, cb)
+  vim.system({ "readelf", "-d", path }, { text = true }, function(r)
+    local out = r.stdout or ""
+    if r.code ~= 0 or out:find("There is no dynamic section") then
+      cb({ "  (no dynamic section — static binary)" }); return
+    end
+    cb(indent(out))
+  end)
+end
+
+runners.notes = function(path, _, _, cb)
+  vim.system({ "readelf", "-n", path }, { text = true }, function(r)
+    if r.code ~= 0 then cb({ "  [error] " .. r.stderr }); return end
+    cb(indent(r.stdout))
+  end)
+end
+
+runners.versions = function(path, _, _, cb)
   -- readelf -V exits non-zero on binaries with no version info
-  local out, _ = run_lax({ "readelf", "-V", path })
-  if out == "" or out:find("no symbol") or out:find("no version") then
-    return { "  (no version information)" }
-  end
-  return indent(out)
-end
-
-local function collect_symbols(path, max)
-  local out, err = run({ "readelf", "-s", "--wide", path })
-  if not out then return { "  [error] " .. err } end
-  local result = {}
-  local count = 0
-  for _, line in ipairs(lines(out)) do
-    if count >= max then
-      result[#result + 1] = "  ... (first " .. max .. " lines shown — increase max_symbols to see more)"
-      break
+  vim.system({ "readelf", "-V", path }, { text = true }, function(r)
+    local out = r.stdout or ""
+    if out == "" or out:find("no symbol") or out:find("no version") then
+      cb({ "  (no version information)" }); return
     end
-    result[#result + 1] = "  " .. line
-    count = count + 1
-  end
-  return result
+    cb(indent(out))
+  end)
 end
 
-local function collect_strings(path, min_len, max)
-  if vim.fn.executable("strings") == 0 then return missing("strings") end
-  local out, err = run({ "strings", "-n", tostring(min_len), path })
-  if not out then return { "  [error] " .. err } end
-  local result = {}
-  local count, total = 0, 0
-  for _, line in ipairs(lines(out)) do
-    total = total + 1
-    if count < max then
+runners.relocations = function(path, _, _, cb)
+  vim.system({ "readelf", "-r", "--wide", path }, { text = true }, function(r)
+    local out = r.stdout or ""
+    if out == "" or out:find("There are no relocations") then
+      cb({ "  (no relocations)" }); return
+    end
+    if r.code ~= 0 then cb({ "  [error] " .. r.stderr }); return end
+    cb(indent(out))
+  end)
+end
+
+runners.symbols = function(path, cfg, exe, cb)
+  vim.system({ "readelf", "-s", "--wide", path }, { text = true }, function(r)
+    if r.code ~= 0 then cb({ "  [error] " .. r.stderr }); return end
+    demangle(r.stdout, exe, cfg, function(out)
+      local capped = cap(lines(out), cfg.max_symbols, "lines")
+      local result = {}
+      for _, line in ipairs(capped) do
+        result[#result + 1] = "  " .. line
+      end
+      cb(result)
+    end)
+  end)
+end
+
+runners.strings = function(path, cfg, exe, cb)
+  if not exe.strings then cb(missing("strings")); return end
+  vim.system({ "strings", "-n", tostring(cfg.min_string_len), path }, { text = true }, function(r)
+    if r.code ~= 0 then cb({ "  [error] " .. r.stderr }); return end
+    local capped = cap(lines(r.stdout), cfg.max_strings, "strings")
+    local result = {}
+    for _, line in ipairs(capped) do
       result[#result + 1] = "  " .. line
-      count = count + 1
     end
-  end
-  if total > max then
-    result[#result + 1] = string.format("  ... (first %d/%d strings shown — increase max_strings to see more)", max, total)
-  end
-  return result
+    cb(result)
+  end)
 end
 
--- ── dispatch ──────────────────────────────────────────────────────────────────
+runners.ldd = function(path, _, exe, cb)
+  if not exe.ldd then cb(missing("ldd")); return end
+  vim.system({ "ldd", path }, { text = true }, function(r)
+    local out = r.stdout or ""
+    local err = r.stderr or ""
+    if out:find("not a dynamic executable") or err:find("not a dynamic executable") then
+      cb({ "  (static binary — no shared dependencies)" }); return
+    end
+    if r.code ~= 0 then cb({ "  [error] " .. err }); return end
+    cb(indent(out))
+  end)
+end
 
-local dispatch = {
-  file     = function(p, _)   return collect_file(p) end,
-  header   = function(p, _)   return collect_header(p) end,
-  checksec = function(p, _)   return collect_checksec(p) end,
-  size     = function(p, _)   return collect_size(p) end,
-  sections = function(p, _)   return collect_sections(p) end,
-  segments = function(p, _)   return collect_segments(p) end,
-  dynamic  = function(p, _)   return collect_dynamic(p) end,
-  notes    = function(p, _)   return collect_notes(p) end,
-  versions = function(p, _)   return collect_versions(p) end,
-  symbols  = function(p, cfg) return collect_symbols(p, cfg.max_symbols) end,
-  strings  = function(p, cfg) return collect_strings(p, cfg.min_string_len, cfg.max_strings) end,
-}
+runners.dwarf = function(path, cfg, _, cb)
+  vim.system({ "readelf", "--debug-dump=info", path }, { text = true }, function(r)
+    local out = r.stdout or ""
+    if out == "" then
+      cb({ "  (no debug symbols — compile with -g)" }); return
+    end
+    local capped = cap(lines(out), cfg.max_dwarf, "lines")
+    local result = {}
+    for _, line in ipairs(capped) do
+      result[#result + 1] = "  " .. line
+    end
+    cb(result)
+  end)
+end
 
-local titles = {
-  file     = "File",
-  header   = "ELF Header",
-  checksec = "Security Properties",
-  size     = "Section Sizes",
-  sections = "Section Headers",
-  segments = "Program Headers / Segments",
-  dynamic  = "Dynamic Section",
-  notes    = "Notes",
-  versions = "Version Information",
-  symbols  = "Symbol Table",
-  strings  = "Strings",
-}
+-- ── rendering ─────────────────────────────────────────────────────────────────
 
--- ── public API ────────────────────────────────────────────────────────────────
+local function render(buf, path, section_order, section_data, cfg)
+  local content = {
+    "  bin.nvim — " .. path,
+    "  " .. string.rep("═", 58),
+  }
+  for _, sec in ipairs(section_order) do
+    if section_data[sec] then
+      vim.list_extend(content, make_section_header(sec, cfg))
+      vim.list_extend(content, section_data[sec])
+    end
+  end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, content)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].buftype    = "nofile"
+  vim.bo[buf].filetype   = "elf"
+  vim.bo[buf].swapfile   = false
+end
+
+local function show_loading(buf, path)
+  local content = {
+    "  bin.nvim — " .. path,
+    "  " .. string.rep("═", 58),
+    "",
+    "  Loading...",
+  }
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, content)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].buftype    = "nofile"
+  vim.bo[buf].filetype   = "elf"
+  vim.bo[buf].swapfile   = false
+end
+
+-- ── keymaps ───────────────────────────────────────────────────────────────────
 
 local function set_keymaps(buf, path)
-  local opts = { noremap = true, silent = true }
-  pcall(vim.api.nvim_buf_del_keymap, buf, "n", "q")
-  pcall(vim.api.nvim_buf_del_keymap, buf, "n", "r")
-  vim.api.nvim_buf_set_keymap(buf, "n", "q", "<cmd>bd<cr>", opts)
-  vim.api.nvim_buf_set_keymap(buf, "n", "r", "", vim.tbl_extend("force", opts, {
-    callback = function() M.open(path) end,
-  }))
+  local o = { noremap = true, silent = true }
+  local function map(key, rhs)
+    pcall(vim.api.nvim_buf_del_keymap, buf, "n", key)
+    vim.api.nvim_buf_set_keymap(buf, "n", key, rhs, o)
+  end
+  local function mapcb(key, fn)
+    pcall(vim.api.nvim_buf_del_keymap, buf, "n", key)
+    vim.api.nvim_buf_set_keymap(buf, "n", key, "", vim.tbl_extend("force", o, { callback = fn }))
+  end
+  map("q", "<cmd>bd<cr>")
+  mapcb("r", function() M.open(path) end)
 end
+
+-- ── fold support (called from ftplugin via foldexpr / foldtext options) ───────
+
+function M.foldexpr(lnum)
+  local line = vim.fn.getline(lnum)
+  -- section chrome and blank lines stay visible at all fold levels
+  if line == ""
+    or line:match("^[┌│└]")
+    or line:match("^  bin%.nvim")
+    or line:match("^  [═]+")
+  then
+    return "0"
+  end
+  return "1"  -- content lines are foldable
+end
+
+function M.foldtext()
+  return "  ··· " .. (vim.v.foldend - vim.v.foldstart + 1) .. " lines"
+end
+
+-- ── public API ────────────────────────────────────────────────────────────────
 
 function M.open(path)
   path = path or vim.api.nvim_buf_get_name(0)
@@ -225,20 +344,8 @@ function M.open(path)
     return
   end
 
-  titles.strings = "Strings (≥" .. M.config.min_string_len .. " chars)"
-
-  local content = {
-    "  bin.nvim — " .. path,
-    "  " .. string.rep("═", 58),
-  }
-
-  for _, sec in ipairs(M.config.sections) do
-    local fn = dispatch[sec]
-    if fn then
-      vim.list_extend(content, section_header(titles[sec] or sec))
-      vim.list_extend(content, fn(path, M.config))
-    end
-  end
+  current_gen = current_gen + 1
+  local gen = current_gen
 
   local bufname = "elf://" .. path
   local buf = vim.fn.bufnr(bufname, false)
@@ -247,15 +354,46 @@ function M.open(path)
     vim.api.nvim_buf_set_name(buf, bufname)
   end
 
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, content)
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].buftype    = "nofile"
-  vim.bo[buf].filetype   = "elf"
-  vim.bo[buf].swapfile   = false
-
+  show_loading(buf, path)
   set_keymaps(buf, path)
   vim.api.nvim_set_current_buf(buf)
+
+  -- snapshot config and check executables on the main thread before going async
+  local cfg = M.config
+  local exe = {
+    file     = vim.fn.executable("file")     == 1,
+    size     = vim.fn.executable("size")     == 1,
+    strings  = vim.fn.executable("strings")  == 1,
+    checksec = vim.fn.executable("checksec") == 1,
+    ldd      = vim.fn.executable("ldd")      == 1,
+    cppfilt  = vim.fn.executable("c++filt")  == 1,
+    rustfilt = vim.fn.executable("rustfilt") == 1,
+  }
+
+  local sections     = cfg.sections
+  local section_data = {}
+  local remaining    = #sections
+
+  local function on_done(sec, data)
+    if gen ~= current_gen then return end  -- superseded by a newer reload
+    section_data[sec] = data
+    remaining = remaining - 1
+    if remaining == 0 then
+      vim.schedule(function()
+        if gen ~= current_gen then return end
+        render(buf, path, sections, section_data, cfg)
+      end)
+    end
+  end
+
+  for _, sec in ipairs(sections) do
+    local runner = runners[sec]
+    if runner then
+      runner(path, cfg, exe, function(data) on_done(sec, data) end)
+    else
+      on_done(sec, { "  (unknown section: " .. sec .. ")" })
+    end
+  end
 end
 
 function M.setup(opts)
