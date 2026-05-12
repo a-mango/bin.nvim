@@ -1,0 +1,30 @@
+*bin.nvim*   ELF binary inspector for Neovim
+
+USAGE                                                        *bin-usage*
+
+bin.nvim intercepts ELF files via |BufReadCmd| and replaces the binary
+buffer with a human-readable summary produced by readelf(1).
+
+Keymaps in the info buffer:
+  q   close buffer
+  r   reload / refresh
+
+CONFIGURATION                                               *bin-config*
+
+>lua
+  require("bin").setup({
+    sections   = { "header", "sections", "segments", "symbols", "dynamic" },
+    max_symbols = 200,
+  })
+<
+
+COMMANDS                                                   *bin-commands*
+
+  :lua require("bin").open()         inspect current file
+  :lua require("bin").open("/path")  inspect a specific file
+
+HEALTH                                                       *bin-health*
+
+  :checkhealth bin
+
+vim:tw=78:ft=help:norl:
