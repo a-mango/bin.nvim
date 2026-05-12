@@ -1,10 +1,14 @@
 local M = {}
 
 M.config = {
-  -- sections to display, in order
-  sections = { "header", "sections", "segments", "symbols", "dynamic" },
-  -- max symbols to show (can be slow for large binaries)
+  sections = {
+    "file", "header", "checksec", "size",
+    "sections", "segments", "dynamic",
+    "notes", "versions", "symbols", "strings",
+  },
   max_symbols = 200,
+  max_strings = 300,
+  min_string_len = 10,
 }
 
 local function run(cmd)
@@ -36,44 +40,98 @@ local function section_header(title)
   return { "", "┌" .. bar, "│  " .. title, "└" .. bar, "" }
 end
 
-local function collect_header(path)
-  local out, err = run({ "readelf", "-h", path })
-  if not out then return { "  [error] " .. (err or "readelf -h failed") } end
+local function indent(out)
   local result = {}
   for _, line in ipairs(lines(out)) do
     result[#result + 1] = "  " .. line
   end
   return result
+end
+
+-- ── collectors ────────────────────────────────────────────────────────────────
+
+local function collect_file(path)
+  local out, err = run({ "file", path })
+  if not out then return { "  [error] " .. (err or "file failed") } end
+  -- strip leading "path: "
+  local info = out:gsub("^[^:]+:%s*", ""):gsub("\n$", "")
+  return { "  " .. info }
+end
+
+local function collect_header(path)
+  local out, err = run({ "readelf", "-h", path })
+  if not out then return { "  [error] " .. (err or "") } end
+  return indent(out)
+end
+
+local function collect_checksec(path)
+  if vim.fn.executable("checksec") == 0 then
+    return { "  (checksec not found — install checksec)" }
+  end
+  local out, err = run({ "checksec", "--file=" .. path, "--output=csv" })
+  if not out then return { "  [error] " .. (err or "") } end
+
+  local fields = {}
+  for field in (out:gsub("\n$", "")):gmatch("[^,]+") do
+    fields[#fields + 1] = field
+  end
+
+  -- CSV: RELRO, STACK CANARY, NX, PIE, RPATH, RUNPATH, Symbols, FORTIFY, Fortified, Fortifiable, FILE
+  local labels = { "RELRO", "Stack Canary", "NX", "PIE", "RPATH", "RUNPATH", "Symbols", "FORTIFY", "Fortified", "Fortifiable" }
+  local result = {}
+  for i, label in ipairs(labels) do
+    local val = fields[i] or "?"
+    result[#result + 1] = string.format("  %-16s %s", label .. ":", val)
+  end
+  return result
+end
+
+local function collect_size(path)
+  local out, err = run({ "size", path })
+  if not out then return { "  [error] " .. (err or "") } end
+  return indent(out)
 end
 
 local function collect_sections(path)
   local out, err = run({ "readelf", "-S", "--wide", path })
-  if not out then return { "  [error] " .. (err or "readelf -S failed") } end
-  local result = {}
-  for _, line in ipairs(lines(out)) do
-    result[#result + 1] = "  " .. line
-  end
-  return result
+  if not out then return { "  [error] " .. (err or "") } end
+  return indent(out)
 end
 
 local function collect_segments(path)
   local out, err = run({ "readelf", "-l", "--wide", path })
-  if not out then return { "  [error] " .. (err or "readelf -l failed") } end
-  local result = {}
-  for _, line in ipairs(lines(out)) do
-    result[#result + 1] = "  " .. line
+  if not out then return { "  [error] " .. (err or "") } end
+  return indent(out)
+end
+
+local function collect_dynamic(path)
+  local out, _ = run({ "readelf", "-d", path })
+  if not out or out:find("There is no dynamic section") then
+    return { "  (no dynamic section — static binary)" }
   end
-  return result
+  return indent(out)
+end
+
+local function collect_notes(path)
+  local out, err = run({ "readelf", "-n", path })
+  if not out then return { "  [error] " .. (err or "") } end
+  return indent(out)
+end
+
+local function collect_versions(path)
+  local out, err = run({ "readelf", "-V", path })
+  if not out then return { "  [error] " .. (err or "") } end
+  return indent(out)
 end
 
 local function collect_symbols(path, max)
   local out, err = run({ "readelf", "-s", "--wide", path })
-  if not out then return { "  [error] " .. (err or "readelf -s failed") } end
+  if not out then return { "  [error] " .. (err or "") } end
   local result = {}
   local count = 0
   for _, line in ipairs(lines(out)) do
     if count >= max then
-      result[#result + 1] = string.format("  ... (truncated, showing %d symbols)", max)
+      result[#result + 1] = string.format("  ... (truncated, showing %d/%d lines)", max, count)
       break
     end
     result[#result + 1] = "  " .. line
@@ -82,37 +140,56 @@ local function collect_symbols(path, max)
   return result
 end
 
-local function collect_dynamic(path)
-  local out, err = run({ "readelf", "-d", path })
-  if not out then
-    -- not a dynamic binary, that's fine
-    return { "  (no dynamic section)" }
-  end
-  if out:find("There is no dynamic section") then
-    return { "  (no dynamic section — static binary)" }
-  end
+local function collect_strings(path, min_len, max)
+  local out, err = run({ "strings", "-n", tostring(min_len), path })
+  if not out then return { "  [error] " .. (err or "") } end
   local result = {}
+  local count = 0
+  local total = 0
   for _, line in ipairs(lines(out)) do
-    result[#result + 1] = "  " .. line
+    total = total + 1
+    if count < max then
+      result[#result + 1] = "  " .. line
+      count = count + 1
+    end
+  end
+  if total > max then
+    result[#result + 1] = string.format("  ... (truncated, showing %d/%d strings)", max, total)
   end
   return result
 end
 
+-- ── dispatch ──────────────────────────────────────────────────────────────────
+
 local dispatch = {
-  header   = function(path, _cfg) return collect_header(path) end,
-  sections = function(path, _cfg) return collect_sections(path) end,
-  segments = function(path, _cfg) return collect_segments(path) end,
-  symbols  = function(path, cfg)  return collect_symbols(path, cfg.max_symbols) end,
-  dynamic  = function(path, _cfg) return collect_dynamic(path) end,
+  file     = function(path, _)   return collect_file(path) end,
+  header   = function(path, _)   return collect_header(path) end,
+  checksec = function(path, _)   return collect_checksec(path) end,
+  size     = function(path, _)   return collect_size(path) end,
+  sections = function(path, _)   return collect_sections(path) end,
+  segments = function(path, _)   return collect_segments(path) end,
+  dynamic  = function(path, _)   return collect_dynamic(path) end,
+  notes    = function(path, _)   return collect_notes(path) end,
+  versions = function(path, _)   return collect_versions(path) end,
+  symbols  = function(path, cfg) return collect_symbols(path, cfg.max_symbols) end,
+  strings  = function(path, cfg) return collect_strings(path, cfg.min_string_len, cfg.max_strings) end,
 }
 
 local titles = {
+  file     = "File",
   header   = "ELF Header",
+  checksec = "Security Properties",
+  size     = "Section Sizes",
   sections = "Section Headers",
   segments = "Program Headers / Segments",
-  symbols  = "Symbol Table",
   dynamic  = "Dynamic Section",
+  notes    = "Notes",
+  versions = "Version Information",
+  symbols  = "Symbol Table",
+  strings  = "Strings (≥" .. M.config.min_string_len .. " chars)",
 }
+
+-- ── public API ────────────────────────────────────────────────────────────────
 
 function M.open(path)
   path = path or vim.api.nvim_buf_get_name(0)
@@ -126,6 +203,9 @@ function M.open(path)
     "  " .. string.rep("═", 58),
   }
 
+  -- update strings title in case min_string_len was customised
+  titles.strings = "Strings (≥" .. M.config.min_string_len .. " chars)"
+
   for _, sec in ipairs(M.config.sections) do
     local fn = dispatch[sec]
     if fn then
@@ -134,7 +214,6 @@ function M.open(path)
     end
   end
 
-  -- create or reuse a buffer named after the file
   local bufname = "elf://" .. path
   local buf = vim.fn.bufnr(bufname, false)
   if buf == -1 then
@@ -142,6 +221,7 @@ function M.open(path)
     vim.api.nvim_buf_set_name(buf, bufname)
   end
 
+  vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, content)
   vim.bo[buf].modifiable = false
   vim.bo[buf].buftype    = "nofile"
@@ -157,15 +237,12 @@ function M.open(path)
     end,
   })
 
-  -- open in current window
   vim.api.nvim_set_current_buf(buf)
 end
 
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 
-  -- BufReadPost fires after normal loading, so non-ELF files are unaffected.
-  -- For ELF files we replace the buffer content with readelf output.
   vim.api.nvim_create_autocmd("BufReadPost", {
     group = vim.api.nvim_create_augroup("bin_nvim", { clear = true }),
     callback = function(ev)
