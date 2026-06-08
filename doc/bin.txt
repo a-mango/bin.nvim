@@ -2,29 +2,60 @@
 
 USAGE                                                        *bin-usage*
 
-bin.nvim intercepts ELF files via |BufReadCmd| and replaces the binary
-buffer with a human-readable summary produced by readelf(1).
+bin.nvim watches |BufReadPost| and, when the file it just read is an ELF
+binary, replaces it with a readable summary built from readelf(1) and a
+handful of optional tools. Each section loads in parallel; a missing
+optional tool leaves a short notice in place of an error.
 
-Keymaps in the info buffer:
-  q   close buffer
-  r   reload / refresh
+Requires Neovim 0.10 or newer (it uses |vim.system()|).
+
+Keymaps inside the inspection buffer:
+  q     close the buffer
+  r     reload and refresh
+  ]]    jump to the next section
+  [[    jump to the previous section
+  zM    collapse every section to its title
+  zR    expand every section
+  za    toggle the section under the cursor
 
 CONFIGURATION                                               *bin-config*
 
+setup() takes an options table; every key is optional and falls back to the
+default shown here.
+
 >lua
   require("bin").setup({
-    sections   = { "header", "sections", "segments", "symbols", "dynamic" },
-    max_symbols = 200,
+    sections = {
+      "file", "header", "checksec", "size",
+      "sections", "segments", "dynamic",
+      "notes", "versions", "relocations",
+      "symbols", "strings", "ldd", "dwarf",
+    },
+    max_symbols    = 200,
+    max_strings    = 300,
+    min_string_len = 10,
+    max_dwarf      = 300,
+    demangle       = true,
   })
 <
 
 COMMANDS                                                   *bin-commands*
 
-  :lua require("bin").open()         inspect current file
+  :Bin                               inspect the current file
+  :Bin /path/to/binary               inspect a specific file
+  :lua require("bin").open()         inspect the current file
   :lua require("bin").open("/path")  inspect a specific file
 
 HEALTH                                                       *bin-health*
 
   :checkhealth bin
+
+LIMITATIONS                                             *bin-limitations*
+
+Detection runs on |BufReadPost|, which means Neovim has already read the whole
+file into a buffer by the time the inspection view replaces it. For a large or
+stripped binary that read costs memory and a moment of lag before the summary
+appears. Reading nothing would mean intercepting before the load, but that path
+blanks ordinary non-ELF buffers, so the trade here is deliberate.
 
 vim:tw=78:ft=help:norl:

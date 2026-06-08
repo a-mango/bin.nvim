@@ -7,9 +7,17 @@ When you open an ELF file, the buffer is populated with the output of several
 analysis tools organised into collapsible sections. All sections are loaded in
 parallel; missing optional tools display a short notice rather than an error.
 
+## Demo
+
+<!-- Record with `vhs demo.tape` (https://github.com/charmbracelet/vhs), commit
+     the result, and reference it here:  ![bin.nvim demo](demo.gif) -->
+
+_A recording is on the way; in the meantime the Output section below shows the
+buffer layout._
+
 ## Requirements
 
-- Neovim >= 0.9
+- Neovim >= 0.10 (for `vim.system`)
 - `readelf` — required (part of binutils)
 - `file`, `size`, `strings`, `ldd` — optional (binutils / glibc)
 - `checksec` — optional
@@ -41,6 +49,9 @@ use {
   end,
 }
 ```
+
+Your plugin manager generates the help tags, so `:help bin.nvim` works once it
+is installed.
 
 ## Configuration
 
@@ -80,7 +91,9 @@ These keymaps are active only inside ELF inspection buffers.
 
 ## Output
 
-Opening any ELF file (e.g. `nvim /usr/bin/ls`) replaces the buffer with:
+Opening any ELF file (e.g. `nvim /usr/bin/ls`) replaces the buffer with the
+inspection view. You can also inspect a file at any time with `:Bin` (current
+file) or `:Bin /path/to/binary`. The buffer then looks like:
 
 ```
   bin.nvim — /usr/bin/ls
@@ -169,6 +182,14 @@ Press `zM` to collapse all sections to their titles for a quick overview:
 ```
 
 Use `]]` / `[[` to move between sections, and `za` to expand the one you need.
+
+## Limitations
+
+Detection happens on `BufReadPost`, so Neovim reads the whole file into a buffer
+before the inspection view replaces it. On a large or stripped binary that costs
+some memory and a brief pause before the summary shows. Intercepting earlier
+would avoid the read but blanks ordinary non-ELF buffers, so the current
+behaviour is a deliberate trade.
 
 ## License
 
