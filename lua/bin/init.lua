@@ -14,9 +14,10 @@ M.config = {
   demangle       = true,
 }
 
--- incremented on every M.open() call; async callbacks check against it to
--- discard results from a superseded reload
-local current_gen = 0
+-- per-buffer generation, bumped on every M.open() for that buffer; async
+-- callbacks check against it to discard results from a superseded reload.
+-- Keyed by buffer so opening a second binary can't strand the first.
+local gens = {}
 
 -- ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -48,12 +49,21 @@ local function missing(tool)
   return { "  (" .. tool .. " not installed — skipping)" }
 end
 
--- caps a list of plain strings; returns a new list with a trailing note when truncated
-local function cap(raw_lines, max, label)
-  if #raw_lines <= max then return raw_lines end
+-- splits `str` into lines but stops once `max` is reached, so a huge dump (the
+-- multi-million-line DWARF of a debug build, say) never materialises in full
+-- just to show a few hundred lines. The config cap thus bounds the work, not
+-- only the display. Adds a trailing note when the output was cut.
+local function cap_lines(str, max, label)
   local t = {}
-  for i = 1, max do t[i] = raw_lines[i] end
-  t[#t + 1] = string.format("... (first %d/%d %s — adjust config to see more)", max, #raw_lines, label)
+  local n = 0
+  for line in (str or ""):gmatch("[^\n]+") do
+    n = n + 1
+    if n > max then
+      t[#t + 1] = string.format("... (first %d %s shown — raise the limit in config to see more)", max, label)
+      break
+    end
+    t[n] = line
+  end
   return t
 end
 
@@ -127,24 +137,28 @@ runners.header = function(path, _, _, cb)
   end)
 end
 
+-- format checksec's CSV row into aligned label/value lines. Splits on commas
+-- while keeping empty fields, so a blank value can't shift the remaining
+-- columns onto the wrong labels.
+local function parse_checksec(raw)
+  local fields = vim.split((raw:gsub("\n$", "")), ",", { plain = true })
+  local labels = {
+    "RELRO", "Stack Canary", "NX", "PIE",
+    "RPATH", "RUNPATH", "Symbols", "FORTIFY",
+    "Fortified", "Fortifiable",
+  }
+  local result = {}
+  for i, label in ipairs(labels) do
+    result[#result + 1] = string.format("  %-16s %s", label .. ":", fields[i] or "?")
+  end
+  return result
+end
+
 runners.checksec = function(path, _, exe, cb)
   if not exe.checksec then cb(missing("checksec")); return end
   vim.system({ "checksec", "--file=" .. path, "--output=csv" }, { text = true }, function(r)
     if r.code ~= 0 then cb({ "  [error] " .. r.stderr }); return end
-    local fields = {}
-    for f in (r.stdout:gsub("\n$", "")):gmatch("[^,]+") do
-      fields[#fields + 1] = f
-    end
-    local labels = {
-      "RELRO", "Stack Canary", "NX", "PIE",
-      "RPATH", "RUNPATH", "Symbols", "FORTIFY",
-      "Fortified", "Fortifiable",
-    }
-    local result = {}
-    for i, label in ipairs(labels) do
-      result[#result + 1] = string.format("  %-16s %s", label .. ":", fields[i] or "?")
-    end
-    cb(result)
+    cb(parse_checksec(r.stdout))
   end)
 end
 
@@ -213,7 +227,7 @@ runners.symbols = function(path, cfg, exe, cb)
   vim.system({ "readelf", "-s", "--wide", path }, { text = true }, function(r)
     if r.code ~= 0 then cb({ "  [error] " .. r.stderr }); return end
     demangle(r.stdout, exe, cfg, function(out)
-      local capped = cap(lines(out), cfg.max_symbols, "lines")
+      local capped = cap_lines(out, cfg.max_symbols, "lines")
       local result = {}
       for _, line in ipairs(capped) do
         result[#result + 1] = "  " .. line
@@ -227,7 +241,7 @@ runners.strings = function(path, cfg, exe, cb)
   if not exe.strings then cb(missing("strings")); return end
   vim.system({ "strings", "-n", tostring(cfg.min_string_len), path }, { text = true }, function(r)
     if r.code ~= 0 then cb({ "  [error] " .. r.stderr }); return end
-    local capped = cap(lines(r.stdout), cfg.max_strings, "strings")
+    local capped = cap_lines(r.stdout, cfg.max_strings, "strings")
     local result = {}
     for _, line in ipairs(capped) do
       result[#result + 1] = "  " .. line
@@ -255,7 +269,7 @@ runners.dwarf = function(path, cfg, _, cb)
     if out == "" then
       cb({ "  (no debug symbols — compile with -g)" }); return
     end
-    local capped = cap(lines(out), cfg.max_dwarf, "lines")
+    local capped = cap_lines(out, cfg.max_dwarf, "lines")
     local result = {}
     for _, line in ipairs(capped) do
       result[#result + 1] = "  " .. line
@@ -281,7 +295,7 @@ local function render(buf, path, section_order, section_data, cfg)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, content)
   vim.bo[buf].modifiable = false
   vim.bo[buf].buftype    = "nofile"
-  vim.bo[buf].filetype   = "elf"
+  vim.bo[buf].filetype   = "binview"
   vim.bo[buf].swapfile   = false
 end
 
@@ -296,7 +310,7 @@ local function show_loading(buf, path)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, content)
   vim.bo[buf].modifiable = false
   vim.bo[buf].buftype    = "nofile"
-  vim.bo[buf].filetype   = "elf"
+  vim.bo[buf].filetype   = "binview"
   vim.bo[buf].swapfile   = false
 end
 
@@ -344,8 +358,10 @@ function M.open(path)
     return
   end
 
-  current_gen = current_gen + 1
-  local gen = current_gen
+  -- whatever buffer we were called from; if the file was read into a normal
+  -- buffer (BufReadPost, or :edit), we wipe it once the preview is up so it
+  -- doesn't linger behind us and resurface when the preview is closed
+  local origin = vim.api.nvim_get_current_buf()
 
   local bufname = "elf://" .. path
   local buf = vim.fn.bufnr(bufname, false)
@@ -354,9 +370,23 @@ function M.open(path)
     vim.api.nvim_buf_set_name(buf, bufname)
   end
 
+  gens[buf] = (gens[buf] or 0) + 1
+  local gen = gens[buf]
+
   show_loading(buf, path)
   set_keymaps(buf, path)
   vim.api.nvim_set_current_buf(buf)
+
+  vim.schedule(function()
+    if origin ~= buf
+      and vim.api.nvim_buf_is_valid(origin)
+      and vim.bo[origin].buftype == ""
+      and vim.fn.fnamemodify(vim.api.nvim_buf_get_name(origin), ":p")
+          == vim.fn.fnamemodify(path, ":p")
+    then
+      vim.api.nvim_buf_delete(origin, { force = true })
+    end
+  end)
 
   -- snapshot config and check executables on the main thread before going async
   local cfg = M.config
@@ -374,13 +404,20 @@ function M.open(path)
   local section_data = {}
   local remaining    = #sections
 
+  -- nothing configured: render the title bar now, rather than waiting forever
+  -- on a countdown that starts already at zero
+  if remaining == 0 then
+    render(buf, path, sections, section_data, cfg)
+    return
+  end
+
   local function on_done(sec, data)
-    if gen ~= current_gen then return end  -- superseded by a newer reload
+    if gen ~= gens[buf] then return end  -- superseded by a newer reload
     section_data[sec] = data
     remaining = remaining - 1
     if remaining == 0 then
       vim.schedule(function()
-        if gen ~= current_gen then return end
+        if gen ~= gens[buf] then return end
         render(buf, path, sections, section_data, cfg)
       end)
     end
@@ -389,7 +426,13 @@ function M.open(path)
   for _, sec in ipairs(sections) do
     local runner = runners[sec]
     if runner then
-      runner(path, cfg, exe, function(data) on_done(sec, data) end)
+      -- vim.system throws synchronously when the tool is absent; catch it so a
+      -- missing dependency degrades to an error section instead of aborting the
+      -- whole open (and leaving the buffer stuck on "Loading...")
+      local ok, err = pcall(runner, path, cfg, exe, function(data) on_done(sec, data) end)
+      if not ok then
+        on_done(sec, { "  [error] " .. tostring(err) })
+      end
     else
       on_done(sec, { "  (unknown section: " .. sec .. ")" })
     end
@@ -398,6 +441,10 @@ end
 
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
+
+  vim.api.nvim_create_user_command("Bin", function(o)
+    M.open(o.args ~= "" and o.args or nil)
+  end, { nargs = "?", complete = "file", desc = "Inspect an ELF binary" })
 
   vim.api.nvim_create_autocmd("BufReadPost", {
     group = vim.api.nvim_create_augroup("bin_nvim", { clear = true }),
@@ -409,5 +456,11 @@ function M.setup(opts)
     end,
   })
 end
+
+-- internals exposed for the test suite; not part of the public API
+M._test = {
+  is_elf         = is_elf,
+  parse_checksec = parse_checksec,
+}
 
 return M
