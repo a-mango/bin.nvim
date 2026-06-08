@@ -1,0 +1,2 @@
+# local test dependencies (plenary.nvim is cloned here by CI / contributors)
+.tests/
