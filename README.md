@@ -9,11 +9,7 @@ parallel; missing optional tools display a short notice rather than an error.
 
 ## Demo
 
-<!-- Record with `vhs demo.tape` (https://github.com/charmbracelet/vhs), commit
-     the result, and reference it here:  ![bin.nvim demo](demo.gif) -->
-
-_A recording is on the way; in the meantime the Output section below shows the
-buffer layout._
+![bin.nvim opening /usr/bin/ls](demo.gif)
 
 ## Requirements
 
