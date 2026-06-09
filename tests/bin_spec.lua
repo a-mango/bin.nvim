@@ -22,6 +22,15 @@ local function open_and_wait(path, timeout)
   return buf, ok
 end
 
+-- vim.fn.bufnr does substring matching, which would match "elf://<path>" when
+-- asked for "<path>"; compare full names instead
+local function buf_by_exact_name(name)
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_get_name(b) == name then return b end
+  end
+  return -1
+end
+
 describe("is_elf", function()
   it("recognises an ELF binary", function()
     assert.is_true(bin._test.is_elf(vim.v.progpath))
@@ -112,5 +121,26 @@ describe("open", function()
       return rendered(b1) and rendered(b2)
     end, 25)
     assert.is_true(ok, "one binary stayed on Loading (stranded)")
+  end)
+
+  it("intercepts a real file read and drops the origin buffer", function()
+    -- the actual `nvim <binary>` path: the BufReadPost autocmd registered by
+    -- setup() fires, M.open swaps in the inspection buffer, and the raw binary
+    -- buffer is wiped so `q` doesn't dump the user back onto it
+    bin.setup({ sections = { "header", "file" } })
+    local target = vim.fn.exepath("readelf")
+    if target == "" then
+      pending("readelf not available")
+      return
+    end
+    vim.cmd.edit(target)
+    local elfname = "elf://" .. target
+    -- cleanup is scheduled right after the buffer swap, independent of render
+    local ok = vim.wait(5000, function()
+      local cur = vim.api.nvim_get_current_buf()
+      return vim.api.nvim_buf_get_name(cur) == elfname
+        and buf_by_exact_name(target) == -1
+    end, 25)
+    assert.is_true(ok, "did not swap to the inspection buffer and remove the origin")
   end)
 end)
