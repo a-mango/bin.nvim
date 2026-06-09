@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # PUC Lua, not LuaJIT: luarocks fails to load the (large) luarocks.org
+      # manifest under LuaJIT with "main function has more than 65536 constants"
+      - uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: "5.4"
+      - uses: leafo/gh-actions-luarocks@v4
+
+      - name: Install luacheck
+        run: luarocks install luacheck
+
+      - name: luacheck
+        run: luacheck lua/ ftplugin/ tests/
+
+      # informational only: stylua reformats the manual column alignment in the
+      # config tables, so a failure here is not treated as a build break
+      - name: stylua (informational)
+        uses: JohnnyMorganz/stylua-action@v4
+        continue-on-error: true
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          version: latest
+          args: --check lua/ ftplugin/ tests/
+
+  test:
+    name: Test (nvim ${{ matrix.nvim }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        nvim: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Neovim
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: ${{ matrix.nvim }}
+
+      - name: Install binutils (readelf, size, strings)
+        run: sudo apt-get update && sudo apt-get install -y binutils
+
+      - name: Fetch plenary.nvim
+        run: git clone --depth 1 https://github.com/nvim-lua/plenary.nvim .tests/plenary.nvim
+
+      - name: Run tests
+        run: |
+          nvim --headless -u tests/minimal_init.lua \
+            -c "PlenaryBustedDirectory tests/ {minimal_init = 'tests/minimal_init.lua'}"
