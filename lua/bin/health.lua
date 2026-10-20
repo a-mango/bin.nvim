@@ -3,10 +3,10 @@ local M = {}
 function M.check()
   vim.health.start("bin.nvim")
 
-  if vim.fn.has("nvim-0.9") == 1 then
-    vim.health.ok("Neovim >= 0.9")
+  if vim.fn.has("nvim-0.10") == 1 then
+    vim.health.ok("Neovim >= 0.10")
   else
-    vim.health.error("Neovim >= 0.9 required (vim.system API)")
+    vim.health.error("Neovim >= 0.10 required (vim.system API)")
   end
 
   local function check(name, pkg, required)
