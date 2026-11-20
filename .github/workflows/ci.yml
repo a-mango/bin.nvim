@@ -10,7 +10,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # PUC Lua, not LuaJIT: luarocks fails to load the (large) luarocks.org
       # manifest under LuaJIT with "main function has more than 65536 constants"
@@ -43,7 +43,7 @@ jobs:
       matrix:
         nvim: [stable, nightly]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Neovim
         uses: rhysd/action-setup-vim@v1
