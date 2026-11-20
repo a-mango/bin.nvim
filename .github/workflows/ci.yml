@@ -14,10 +14,10 @@ jobs:
 
       # PUC Lua, not LuaJIT: luarocks fails to load the (large) luarocks.org
       # manifest under LuaJIT with "main function has more than 65536 constants"
-      - uses: leafo/gh-actions-lua@v10
+      - uses: leafo/gh-actions-lua@v13
         with:
           luaVersion: "5.4"
-      - uses: leafo/gh-actions-luarocks@v4
+      - uses: leafo/gh-actions-luarocks@v6
 
       - name: Install luacheck
         run: luarocks install luacheck
@@ -28,7 +28,7 @@ jobs:
       # informational only: stylua reformats the manual column alignment in the
       # config tables, so a failure here is not treated as a build break
       - name: stylua (informational)
-        uses: JohnnyMorganz/stylua-action@v4
+        uses: JohnnyMorganz/stylua-action@v5
         continue-on-error: true
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
